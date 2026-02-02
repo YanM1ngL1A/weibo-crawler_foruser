@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 import codecs
@@ -69,6 +69,27 @@ class Weibo(object):
             logger.error("since_date 格式不正确，请确认配置是否正确")
             sys.exit()
         self.since_date = since_date  # 起始时间，即爬取发布日期从该值到现在的微博，形式为yyyy-mm-ddThh:mm:ss，如：2023-08-21T09:23:03
+
+        end_date = config.get("end_date")
+        if end_date in ("", None, 0):
+            end_date = None
+        elif isinstance(end_date, int):
+            end_date = date.today() - timedelta(end_date)
+            end_date = end_date.strftime(DTFORMAT)
+        elif self.is_date(end_date):
+            end_date = "{}T23:59:59".format(end_date)
+        elif self.is_datetime(end_date):
+            pass
+        else:
+            logger.error("end_date 格式不正确，请确认配置是否正确")
+            sys.exit()
+        self.end_date = end_date  # 结束时间，若设置则只爬取早于等于该时间的微博
+        if self.end_date:
+            since_dt = datetime.strptime(self.since_date, DTFORMAT)
+            end_dt = datetime.strptime(self.end_date, DTFORMAT)
+            if end_dt < since_dt:
+                logger.error("end_date 早于 since_date，请确认配置是否正确")
+                sys.exit()
         self.start_page = config.get("start_page", 1)  # 开始爬的页，如果中途被限制而结束可以用此定义开始页码
         self.write_mode = config[
             "write_mode"
@@ -107,6 +128,10 @@ class Weibo(object):
         self.change_file_time = config.get(
             "change_file_time", 0
         )  # 是否修改文件时间，取值范围为0、1, 0代表不开启, 1代表开启
+        self.page_jump_size = config.get("page_jump_size", 1)  # 跳页步长，1表示逐页
+        self.update_user_config_file_enabled = config.get(
+            "update_user_config_file", 1
+        )  # 是否允许自动更新user_id_list.txt，1=允许，0=禁止
         
         # Cookie支持：优先使用环境变量WEIBO_COOKIE，其次使用config.json中的配置
         cookie_string = os.environ.get("WEIBO_COOKIE") or config.get("cookie")
@@ -157,6 +182,7 @@ class Weibo(object):
         self.mongodb_URI = config.get("mongodb_URI")  # MongoDB数据库连接字符串，可以不填
         self.post_config = config.get("post_config")  # post_config，可以不填
         self.page_weibo_count = config.get("page_weibo_count")  # page_weibo_count，爬取一页的微博数，默认10页
+        self.output_directory = config.get("output_directory", "")  # 输出目录（可选）
         
         # 初始化 LLM 分析器
         self.llm_analyzer = LLMAnalyzer(config) if config.get("llm_config") else None
@@ -201,13 +227,14 @@ class Weibo(object):
                 {
                     "user_id": user_id,
                     "since_date": self.since_date,
+                    "end_date": self.end_date,
                     "query_list": query_list,
                 }
                 for user_id in user_id_list
             ]
 
         self.user_config_list = user_config_list  # 要爬取的微博用户的user_config列表
-        self.user_config = {}  # 用户配置,包含用户id和since_date
+        self.user_config = {}  # 用户配置,包含用户id和since_date/end_date
         self.start_date = ""  # 获取用户第一条微博时的日期
         self.query = ""
         self.user = {}  # 存储目标微博用户信息
@@ -423,6 +450,7 @@ class Weibo(object):
             "retweet_live_photo_download",
             "download_comment",
             "download_repost",
+            "update_user_config_file",
         ]
         for argument in argument_list:
             # 使用 get() 获取值，新增字段默认为0
@@ -470,6 +498,19 @@ class Weibo(object):
         since_date = config["since_date"]
         if (not isinstance(since_date, int)) and (not self.is_datetime(since_date)) and (not self.is_date(since_date)):
             logger.warning("since_date值应为yyyy-mm-dd形式、yyyy-mm-ddTHH:MM:SS形式或整数，请重新输入")
+            sys.exit()
+
+        # 验证end_date（可选）
+        end_date = config.get("end_date")
+        if end_date not in ("", None, 0):
+            if (not isinstance(end_date, int)) and (not self.is_datetime(end_date)) and (not self.is_date(end_date)):
+                logger.warning("end_date值应为yyyy-mm-dd形式、yyyy-mm-ddTHH:MM:SS形式或整数，请重新输入")
+                sys.exit()
+
+        # 验证page_jump_size（可选）
+        page_jump_size = config.get("page_jump_size", 1)
+        if not isinstance(page_jump_size, int) or page_jump_size < 1:
+            logger.warning("page_jump_size应为>=1的整数")
             sys.exit()
 
         comment_max_count = config["comment_max_download_count"]
@@ -1650,6 +1691,11 @@ class Weibo(object):
                 
                 if self.query:
                     weibos = weibos[0]["card_group"]
+                page_earliest = None
+                since_date = datetime.strptime(self.user_config["since_date"], DTFORMAT)
+                end_date = None
+                if self.user_config.get("end_date"):
+                    end_date = datetime.strptime(self.user_config["end_date"], DTFORMAT)
                 # 如果需要检查cookie，在循环第一个人的时候，就要看看仅自己可见的信息有没有，要是没有直接报错
                 for w in weibos:
                     if w["card_type"] == 11:
@@ -1659,6 +1705,27 @@ class Weibo(object):
                         else:
                             w = w
                     if w["card_type"] == 9:
+                        mblog = w.get("mblog") or {}
+                        raw_created_at = mblog.get("created_at")
+                        if raw_created_at:
+                            try:
+                                quick_created_at = datetime.strptime(
+                                    self.standardize_date(raw_created_at)[0], DTFORMAT
+                                )
+                                if page_earliest is None or quick_created_at < page_earliest:
+                                    page_earliest = quick_created_at
+                            except Exception:
+                                pass
+                        if end_date and (not const.CHECK_COOKIE["CHECK"] or const.CHECK_COOKIE["CHECKED"]):
+                            if raw_created_at:
+                                try:
+                                    quick_created_at = datetime.strptime(
+                                        self.standardize_date(raw_created_at)[0], DTFORMAT
+                                    )
+                                    if quick_created_at > end_date:
+                                        continue
+                                except Exception:
+                                    pass
                         wb = self.get_one_weibo(w)
                         if wb:
                             if (
@@ -1675,9 +1742,6 @@ class Weibo(object):
                             if wb["id"] in self.weibo_id_list:
                                 continue
                             created_at = datetime.strptime(wb["created_at"], DTFORMAT)
-                            since_date = datetime.strptime(
-                                self.user_config["since_date"], DTFORMAT
-                            )
                             if const.MODE == "append":
                                 # append模式：增量获取微博
                                 if self.first_crawler:
@@ -1715,6 +1779,9 @@ class Weibo(object):
                                     convert_to_days_ago(self.last_weibo_date, 1),
                                     DTFORMAT,
                                 )
+                            if end_date and created_at > end_date:
+                                logger.debug(f"[日期过滤] 微博ID={wb['id']}, 发布时间={created_at}, 结束时间={end_date}, 被跳过")
+                                continue
                             if created_at < since_date:
                                 # 检查是否为置顶微博
                                 is_pinned = w.get("mblog", {}).get("mblogtype", 0) == 2
@@ -1774,6 +1841,12 @@ class Weibo(object):
                     if const.NOTIFY["NOTIFY"]:
                         push_deer("经检查，cookie无效，系统退出")
                     sys.exit()
+                self.last_page_earliest = page_earliest
+                if page_earliest:
+                    logger.info(
+                        "本页最早发布时间: %s",
+                        page_earliest.strftime("%Y-%m-%d %H:%M:%S"),
+                    )
             else:
                 return True
             logger.info(
@@ -1839,13 +1912,12 @@ class Weibo(object):
             dir_name = self.user["screen_name"]
             if self.user_id_as_folder_name:
                 dir_name = str(self.user_config["user_id"])
-            file_dir = (
-                os.path.split(os.path.realpath(__file__))[0]
-                + os.sep
-                + "weibo"
-                + os.sep
-                + dir_name
-            )
+            base_dir = self.output_directory
+            if not base_dir:
+                base_dir = os.path.join(
+                    os.path.split(os.path.realpath(__file__))[0], "weibo"
+                )
+            file_dir = os.path.join(base_dir, dir_name)
             if type in ["img", "video", "live_photo"]:
                 file_dir = file_dir + os.sep + type
             elif type == "markdown":
@@ -2919,8 +2991,14 @@ class Weibo(object):
                 page1 = 0
                 random_pages = random.randint(1, 5)
                 self.start_date = datetime.now().strftime(DTFORMAT)
-                pages = range(self.start_page, page_count + 1)
-                for page in tqdm(pages, desc="Progress"):
+                end_date_dt = None
+                if self.end_date:
+                    end_date_dt = datetime.strptime(self.end_date, DTFORMAT)
+                jump_mode = self.page_jump_size > 1 and end_date_dt is not None
+                last_jump_page = None
+                page = self.start_page
+                pbar = tqdm(total=page_count - self.start_page + 1, desc="Progress")
+                while page <= page_count:
                     is_end = self.get_one_page(page)
                     
                     # 防封禁：检查是否需要休息
@@ -2934,9 +3012,12 @@ class Weibo(object):
                         
                         # 重置统计，继续爬取
                         self.reset_crawl_stats()
+                        pbar.update(1)
+                        page += 1
                         continue
                     
                     if is_end:
+                        pbar.update(1)
                         break
 
                     # 防封禁：检查批次延迟
@@ -2961,6 +3042,35 @@ class Weibo(object):
                             sleep(random.randint(6, 10))
                             page1 = page
                             random_pages = random.randint(1, 5)
+                    pbar.update(1)
+
+                    # 安全跳页逻辑：先跳查，若跳过头则回退逐页检查，确保不漏
+                    if jump_mode and end_date_dt and self.last_page_earliest:
+                        if self.last_page_earliest > end_date_dt:
+                            last_jump_page = page
+                            next_page = page + self.page_jump_size
+                            logger.info(
+                                "跳页加速：当前页最早时间 %s 晚于 end_date %s，跳到第 %d 页",
+                                self.last_page_earliest.strftime("%Y-%m-%d %H:%M:%S"),
+                                end_date_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                                next_page,
+                            )
+                            page = next_page
+                            continue
+                        # 已接近或达到 end_date，回退到上次跳页后的下一页逐页检查
+                        if last_jump_page is not None and page - last_jump_page > 1:
+                            back_page = last_jump_page + 1
+                            logger.info(
+                                "跳页过头，回退到第 %d 页逐页检查直到 end_date",
+                                back_page,
+                            )
+                            page = back_page
+                            jump_mode = False
+                            continue
+                        jump_mode = False
+
+                    page += 1
+                pbar.close()
 
                 self.write_data(wrote_count)  # 将剩余不足20页的微博写入文件
 
@@ -3010,6 +3120,7 @@ class Weibo(object):
                         user_config["query_list"] = info[3].split(",")
                     else:
                         user_config["query_list"] = self.query_list
+                    user_config["end_date"] = self.end_date
                     if user_config not in user_config_list:
                         user_config_list.append(user_config)
         return user_config_list
@@ -3021,6 +3132,7 @@ class Weibo(object):
         self.user_config = user_config
         self.got_count = 0
         self.weibo_id_list = []
+        self.last_page_earliest = None
 
     def start(self):
         """运行爬虫"""
@@ -3040,7 +3152,7 @@ class Weibo(object):
 
                 logger.info("信息抓取完毕")
                 logger.info("*" * 100)
-                if self.user_config_file_path and self.user:
+                if self.user_config_file_path and self.user and self.update_user_config_file_enabled:
                     self.update_user_config_file(self.user_config_file_path)
         except Exception as e:
             logger.exception(e)
