@@ -182,6 +182,7 @@ class Weibo(object):
         self.mongodb_URI = config.get("mongodb_URI")  # MongoDB数据库连接字符串，可以不填
         self.post_config = config.get("post_config")  # post_config，可以不填
         self.page_weibo_count = config.get("page_weibo_count")  # page_weibo_count，爬取一页的微博数，默认10页
+        self.max_weibo_count = config.get("max_weibo_count", 0)  # 单用户最多抓取微博数，0表示不限制
         self.output_directory = config.get("output_directory", "")  # 输出目录（可选）
         
         # 初始化 LLM 分析器
@@ -511,6 +512,12 @@ class Weibo(object):
         page_jump_size = config.get("page_jump_size", 1)
         if not isinstance(page_jump_size, int) or page_jump_size < 1:
             logger.warning("page_jump_size应为>=1的整数")
+            sys.exit()
+
+        # 验证max_weibo_count（可选）
+        max_weibo_count = config.get("max_weibo_count", 0)
+        if not isinstance(max_weibo_count, int) or max_weibo_count < 0:
+            logger.warning("max_weibo_count应为>=0的整数")
             sys.exit()
 
         comment_max_count = config["comment_max_download_count"]
@@ -1815,6 +1822,13 @@ class Weibo(object):
                                 self.weibo.append(wb)
                                 self.weibo_id_list.append(wb["id"])
                                 self.got_count += 1
+
+                                if self.max_weibo_count and self.got_count >= self.max_weibo_count:
+                                    logger.info(
+                                        "达到最大抓取数量 %d，停止继续爬取",
+                                        self.max_weibo_count,
+                                    )
+                                    return True
 
                                 # 防封禁：更新微博统计
                                 self.update_crawl_stats(weibo_count=1)
